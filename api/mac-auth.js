@@ -1,296 +1,267 @@
-// api/mac-auth.js - MAC Authentication API Handler (Server Only)
-import MACDatabase from '../mac-database.js';
+// api/mac-auth.js - MAC Address Authentication API with File-Based Persistence
+import fs from 'fs/promises';
+import path from 'path';
 import crypto from 'crypto';
 
-// Initialize database
-const macDB = new MACDatabase();
+// Storage configuration - use multiple persistence strategies
+const DATA_FILE = path.join(process.cwd(), 'data', 'mac-whitelist.json');
+const BACKUP_FILE = path.join('/tmp', 'mac-whitelist-backup.json');
 
-// Admin authentication helper
-function verifyAdminKey(adminKey, requiredKey) {
-    if (!adminKey || !requiredKey) {
-        return false;
+// Initialize data structure
+let macWhitelist = new Map();
+let statistics = {
+    total: 0,
+    activeLast24h: 0,
+    activeLast7d: 0,
+    neverUsed: 0,
+    totalAccesses: 0
+};
+
+// Ensure data directory exists
+async function ensureDataDirectory() {
+    try {
+        const dataDir = path.dirname(DATA_FILE);
+        await fs.mkdir(dataDir, { recursive: true });
+        console.log('Data directory ensured:', dataDir);
+    } catch (error) {
+        console.log('Data directory creation skipped:', error.message);
     }
-    return adminKey === requiredKey;
 }
 
-// Request validation helper
-function validateMACAddress(macAddress) {
-    const macRegex = /^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$/;
-    return macRegex.test(macAddress);
+// Load MAC whitelist from persistent storage
+async function loadMACWhitelist() {
+    try {
+        // Try to load from main data file first
+        await ensureDataDirectory();
+        
+        let data;
+        try {
+            const fileData = await fs.readFile(DATA_FILE, 'utf8');
+            data = JSON.parse(fileData);
+            console.log('MAC whitelist loaded from main data file');
+        } catch (mainError) {
+            // Fallback to backup file
+            try {
+                const backupData = await fs.readFile(BACKUP_FILE, 'utf8');
+                data = JSON.parse(backupData);
+                console.log('MAC whitelist loaded from backup file');
+                
+                // Try to restore main file from backup
+                try {
+                    await fs.writeFile(DATA_FILE, backupData);
+                    console.log('Main data file restored from backup');
+                } catch (restoreError) {
+                    console.log('Could not restore main file:', restoreError.message);
+                }
+            } catch (backupError) {
+                // No existing data, start fresh
+                console.log('No existing MAC whitelist found, starting fresh');
+                data = { macAddresses: [], statistics: statistics };
+            }
+        }
+        
+        // Convert array to Map for efficient lookups
+        macWhitelist.clear();
+        if (data.macAddresses && Array.isArray(data.macAddresses)) {
+            data.macAddresses.forEach(entry => {
+                macWhitelist.set(entry.macAddress, entry);
+            });
+        }
+        
+        // Update statistics
+        if (data.statistics) {
+            statistics = { ...statistics, ...data.statistics };
+        }
+        
+        console.log(`Loaded ${macWhitelist.size} MAC addresses from storage`);
+        
+    } catch (error) {
+        console.error('Error loading MAC whitelist:', error);
+        // Start with empty whitelist if loading fails
+        macWhitelist.clear();
+    }
 }
 
-// Rate limiting helper (simple in-memory store)
-const rateLimitStore = new Map();
-const RATE_LIMIT = 60; // requests per hour
-const RATE_LIMIT_WINDOW = 60 * 60 * 1000; // 1 hour in milliseconds
+// Save MAC whitelist to persistent storage
+async function saveMACWhitelist() {
+    const data = {
+        macAddresses: Array.from(macWhitelist.values()),
+        statistics: statistics,
+        lastUpdated: new Date().toISOString(),
+        version: '1.0'
+    };
+    
+    const jsonData = JSON.stringify(data, null, 2);
+    
+    try {
+        // Save to main file
+        await ensureDataDirectory();
+        await fs.writeFile(DATA_FILE, jsonData);
+        console.log('MAC whitelist saved to main data file');
+    } catch (error) {
+        console.log('Could not save to main file:', error.message);
+    }
+    
+    try {
+        // Always save backup
+        await fs.writeFile(BACKUP_FILE, jsonData);
+        console.log('MAC whitelist backup saved');
+    } catch (error) {
+        console.log('Could not save backup:', error.message);
+    }
+}
 
-function checkRateLimit(identifier) {
+// Update statistics
+function updateStatistics() {
     const now = Date.now();
-    const key = identifier;
+    const oneDayAgo = now - (24 * 60 * 60 * 1000);
+    const oneWeekAgo = now - (7 * 24 * 60 * 60 * 1000);
     
-    if (!rateLimitStore.has(key)) {
-        rateLimitStore.set(key, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
-        return true;
+    statistics.total = macWhitelist.size;
+    statistics.activeLast24h = 0;
+    statistics.activeLast7d = 0;
+    statistics.neverUsed = 0;
+    statistics.totalAccesses = 0;
+    
+    for (const entry of macWhitelist.values()) {
+        const lastSeen = entry.lastSeen ? new Date(entry.lastSeen).getTime() : 0;
+        statistics.totalAccesses += entry.accessCount || 0;
+        
+        if (lastSeen === 0) {
+            statistics.neverUsed++;
+        } else {
+            if (lastSeen > oneDayAgo) {
+                statistics.activeLast24h++;
+            }
+            if (lastSeen > oneWeekAgo) {
+                statistics.activeLast7d++;
+            }
+        }
     }
-    
-    const entry = rateLimitStore.get(key);
-    
-    if (now > entry.resetTime) {
-        entry.count = 1;
-        entry.resetTime = now + RATE_LIMIT_WINDOW;
-        return true;
-    }
-    
-    if (entry.count >= RATE_LIMIT) {
-        return false;
-    }
-    
-    entry.count++;
-    return true;
 }
 
-// Security logging
-function logSecurityEvent(event, details, ip = 'unknown') {
-    const timestamp = new Date().toISOString();
-    console.log(`[SECURITY] ${timestamp} | IP: ${ip} | Event: ${event} | Details: ${details}`);
+// Validate admin key
+function validateAdminKey(providedKey) {
+    // In production, you should set this as an environment variable
+    const ADMIN_SECRET_KEY = process.env.ADMIN_SECRET_KEY || "default-admin-key-change-this";
+    return providedKey === ADMIN_SECRET_KEY;
 }
 
 // Main API handler
 export default async function handler(req, res) {
-    const { method, query, body } = req;
-    const action = query.action;
-    const clientIP = req.headers['x-forwarded-for'] || req.connection.remoteAddress || 'unknown';
+    // Load MAC whitelist at the start of each request
+    await loadMACWhitelist();
     
-    // CORS headers
+    // Handle CORS
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     
-    if (method === 'OPTIONS') {
+    if (req.method === 'OPTIONS') {
         return res.status(200).end();
     }
     
+    const { action } = req.query;
+    
     try {
-        // Basic rate limiting
-        if (!checkRateLimit(clientIP)) {
-            logSecurityEvent('RATE_LIMIT_EXCEEDED', 'Too many requests', clientIP);
-            return res.status(429).json({
-                success: false,
-                message: 'Too many requests. Please try again later.'
-            });
-        }
-        
-        // Handle different actions
         switch (action) {
             case 'check-access':
-                return await handleCheckAccess(req, res, clientIP);
+                return await handleCheckAccess(req, res);
             case 'add-mac':
-                return await handleAddMAC(req, res, clientIP);
+                return await handleAddMAC(req, res);
             case 'update-access':
-                return await handleUpdateAccess(req, res, clientIP);
+                return await handleUpdateAccess(req, res);
             case 'remove-mac':
-                return await handleRemoveMAC(req, res, clientIP);
+                return await handleRemoveMAC(req, res);
             case 'list-macs':
-                return await handleListMACs(req, res, clientIP);
+                return await handleListMACs(req, res);
             case 'bulk-add':
-                return await handleBulkAdd(req, res, clientIP);
+                return await handleBulkAdd(req, res);
             default:
-                logSecurityEvent('INVALID_ACTION', `Unknown action: ${action}`, clientIP);
                 return res.status(400).json({
                     success: false,
-                    message: 'Invalid action specified'
+                    message: 'Invalid action'
                 });
         }
     } catch (error) {
         console.error('API Error:', error);
-        logSecurityEvent('API_ERROR', error.message, clientIP);
         return res.status(500).json({
             success: false,
-            message: 'Internal server error'
+            message: 'Internal server error',
+            error: error.message
         });
     }
 }
 
-// Check MAC address access
-async function handleCheckAccess(req, res, clientIP) {
-    if (req.method !== 'POST') {
-        return res.status(405).json({ success: false, message: 'Method not allowed' });
-    }
-    
+// Check if MAC address has access
+async function handleCheckAccess(req, res) {
     const { macAddresses, deviceInfo } = req.body;
     
     if (!macAddresses || !Array.isArray(macAddresses) || macAddresses.length === 0) {
-        logSecurityEvent('INVALID_REQUEST', 'Missing or invalid MAC addresses', clientIP);
         return res.status(400).json({
             success: false,
             message: 'MAC addresses are required'
         });
     }
     
-    if (!deviceInfo) {
-        logSecurityEvent('INVALID_REQUEST', 'Missing device info', clientIP);
-        return res.status(400).json({
-            success: false,
-            message: 'Device information is required'
-        });
-    }
-    
-    // Validate MAC addresses
-    for (const mac of macAddresses) {
-        if (!validateMACAddress(mac)) {
-            logSecurityEvent('INVALID_MAC', `Invalid MAC format: ${mac}`, clientIP);
-            return res.status(400).json({
-                success: false,
-                message: `Invalid MAC address format: ${mac}`
-            });
+    // Check if any of the provided MAC addresses are whitelisted
+    let authorizedEntry = null;
+    for (const macAddress of macAddresses) {
+        const normalizedMac = macAddress.toLowerCase();
+        if (macWhitelist.has(normalizedMac)) {
+            authorizedEntry = macWhitelist.get(normalizedMac);
+            break;
         }
     }
     
-    deviceInfo.clientIP = clientIP;
-    
-    try {
-        const result = await macDB.checkAccess(macAddresses, deviceInfo);
-        
-        if (result.success) {
-            logSecurityEvent('ACCESS_GRANTED', `MAC: ${macAddresses[0]}, Device: ${deviceInfo.hostname}`, clientIP);
-        } else {
-            logSecurityEvent('ACCESS_DENIED', `MAC: ${macAddresses[0]}, Device: ${deviceInfo.hostname}`, clientIP);
-        }
-        
-        return res.status(200).json(result);
-    } catch (error) {
-        logSecurityEvent('DATABASE_ERROR', error.message, clientIP);
-        return res.status(500).json({
+    if (!authorizedEntry) {
+        return res.status(403).json({
             success: false,
-            message: 'Database error occurred'
+            message: 'Device not authorized. MAC address not in whitelist.',
+            data: null
         });
     }
+    
+    // Update last seen and access count
+    authorizedEntry.lastSeen = new Date().toISOString();
+    authorizedEntry.accessCount = (authorizedEntry.accessCount || 0) + 1;
+    
+    // Update device info if provided
+    if (deviceInfo) {
+        authorizedEntry.lastDevice = {
+            hostname: deviceInfo.hostname,
+            username: deviceInfo.username,
+            platform: deviceInfo.platform,
+            localIP: deviceInfo.localIP,
+            publicIP: deviceInfo.publicIP
+        };
+    }
+    
+    // Save updated data
+    await saveMACWhitelist();
+    
+    return res.status(200).json({
+        success: true,
+        message: 'Device authorized',
+        data: {
+            macAddress: authorizedEntry.macAddress,
+            description: authorizedEntry.description,
+            accessType: authorizedEntry.accessType || 'trial',
+            addedAt: authorizedEntry.addedAt,
+            lastSeen: authorizedEntry.lastSeen,
+            accessCount: authorizedEntry.accessCount
+        }
+    });
 }
 
-// Add MAC address to whitelist (Admin only)
-async function handleAddMAC(req, res, clientIP) {
-    if (req.method !== 'POST') {
-        return res.status(405).json({ success: false, message: 'Method not allowed' });
-    }
+// Add MAC address to whitelist
+async function handleAddMAC(req, res) {
+    const { macAddress, description, accessType, adminKey } = req.body;
     
-    const { macAddress, description, accessType = 'trial', adminKey } = req.body;
-    
-    const requiredAdminKey = process.env.ADMIN_SECRET_KEY || 'default-admin-key-change-me';
-    if (!verifyAdminKey(adminKey, requiredAdminKey)) {
-        logSecurityEvent('UNAUTHORIZED_ADMIN', 'Invalid admin key provided', clientIP);
-        return res.status(401).json({
+    if (!validateAdminKey(adminKey)) {
+        return res.status(403).json({
             success: false,
-            message: 'Unauthorized: Invalid admin credentials'
-        });
-    }
-    
-    if (!macAddress || !description) {
-        return res.status(400).json({
-            success: false,
-            message: 'MAC address and description are required'
-        });
-    }
-    
-    if (!validateMACAddress(macAddress)) {
-        return res.status(400).json({
-            success: false,
-            message: 'Invalid MAC address format'
-        });
-    }
-    
-    if (!['trial', 'unlimited', 'admin'].includes(accessType)) {
-        return res.status(400).json({
-            success: false,
-            message: 'Invalid access type. Must be: trial, unlimited, or admin'
-        });
-    }
-    
-    try {
-        const result = await macDB.addMACAddress(macAddress, description, accessType);
-        
-        if (result.success) {
-            logSecurityEvent('MAC_ADDED', `MAC: ${macAddress}, Type: ${accessType}, Desc: ${description}`, clientIP);
-        }
-        
-        return res.status(result.success ? 200 : 400).json(result);
-    } catch (error) {
-        logSecurityEvent('DATABASE_ERROR', error.message, clientIP);
-        return res.status(500).json({
-            success: false,
-            message: 'Database error occurred'
-        });
-    }
-}
-
-// Update MAC address access type (Admin only)
-async function handleUpdateAccess(req, res, clientIP) {
-    if (req.method !== 'POST') {
-        return res.status(405).json({ success: false, message: 'Method not allowed' });
-    }
-    
-    const { macAddress, accessType, adminKey } = req.body;
-    
-    const requiredAdminKey = process.env.ADMIN_SECRET_KEY || 'default-admin-key-change-me';
-    if (!verifyAdminKey(adminKey, requiredAdminKey)) {
-        logSecurityEvent('UNAUTHORIZED_ADMIN', 'Invalid admin key for update', clientIP);
-        return res.status(401).json({
-            success: false,
-            message: 'Unauthorized: Invalid admin credentials'
-        });
-    }
-    
-    if (!macAddress || !accessType) {
-        return res.status(400).json({
-            success: false,
-            message: 'MAC address and access type are required'
-        });
-    }
-    
-    if (!validateMACAddress(macAddress)) {
-        return res.status(400).json({
-            success: false,
-            message: 'Invalid MAC address format'
-        });
-    }
-    
-    if (!['trial', 'unlimited', 'admin'].includes(accessType)) {
-        return res.status(400).json({
-            success: false,
-            message: 'Invalid access type. Must be: trial, unlimited, or admin'
-        });
-    }
-    
-    try {
-        const result = await macDB.updateMACAccess(macAddress, accessType);
-        
-        if (result.success) {
-            logSecurityEvent('MAC_UPDATED', `MAC: ${macAddress}, New Type: ${accessType}`, clientIP);
-        }
-        
-        return res.status(result.success ? 200 : 400).json(result);
-    } catch (error) {
-        logSecurityEvent('DATABASE_ERROR', error.message, clientIP);
-        return res.status(500).json({
-            success: false,
-            message: 'Database error occurred'
-        });
-    }
-}
-
-// Remove MAC address from whitelist (Admin only)
-async function handleRemoveMAC(req, res, clientIP) {
-    if (req.method !== 'DELETE') {
-        return res.status(405).json({ success: false, message: 'Method not allowed' });
-    }
-    
-    const { macAddress, adminKey } = req.body;
-    
-    const requiredAdminKey = process.env.ADMIN_SECRET_KEY || 'default-admin-key-change-me';
-    if (!verifyAdminKey(adminKey, requiredAdminKey)) {
-        logSecurityEvent('UNAUTHORIZED_ADMIN', 'Invalid admin key for removal', clientIP);
-        return res.status(401).json({
-            success: false,
-            message: 'Unauthorized: Invalid admin credentials'
+            message: 'Invalid admin key'
         });
     }
     
@@ -301,117 +272,208 @@ async function handleRemoveMAC(req, res, clientIP) {
         });
     }
     
-    if (!validateMACAddress(macAddress)) {
+    const normalizedMac = macAddress.toLowerCase();
+    const validAccessTypes = ['trial', 'unlimited', 'admin'];
+    const finalAccessType = validAccessTypes.includes(accessType) ? accessType : 'trial';
+    
+    if (macWhitelist.has(normalizedMac)) {
+        return res.status(409).json({
+            success: false,
+            message: 'MAC address already exists in whitelist'
+        });
+    }
+    
+    const entry = {
+        macAddress: normalizedMac,
+        description: description || 'No description',
+        accessType: finalAccessType,
+        addedAt: new Date().toISOString(),
+        lastSeen: null,
+        accessCount: 0,
+        lastDevice: null
+    };
+    
+    macWhitelist.set(normalizedMac, entry);
+    await saveMACWhitelist();
+    
+    return res.status(201).json({
+        success: true,
+        message: 'MAC address added successfully',
+        data: entry
+    });
+}
+
+// Update access type for existing MAC
+async function handleUpdateAccess(req, res) {
+    const { macAddress, accessType, adminKey } = req.body;
+    
+    if (!validateAdminKey(adminKey)) {
+        return res.status(403).json({
+            success: false,
+            message: 'Invalid admin key'
+        });
+    }
+    
+    if (!macAddress || !accessType) {
         return res.status(400).json({
             success: false,
-            message: 'Invalid MAC address format'
+            message: 'MAC address and access type are required'
         });
     }
     
-    try {
-        const result = await macDB.removeMACAddress(macAddress);
-        
-        if (result.success) {
-            logSecurityEvent('MAC_REMOVED', `MAC: ${macAddress}`, clientIP);
-        }
-        
-        return res.status(result.success ? 200 : 400).json(result);
-    } catch (error) {
-        logSecurityEvent('DATABASE_ERROR', error.message, clientIP);
-        return res.status(500).json({
+    const normalizedMac = macAddress.toLowerCase();
+    const validAccessTypes = ['trial', 'unlimited', 'admin'];
+    
+    if (!validAccessTypes.includes(accessType)) {
+        return res.status(400).json({
             success: false,
-            message: 'Database error occurred'
+            message: 'Invalid access type. Must be: trial, unlimited, or admin'
         });
     }
+    
+    if (!macWhitelist.has(normalizedMac)) {
+        return res.status(404).json({
+            success: false,
+            message: 'MAC address not found in whitelist'
+        });
+    }
+    
+    const entry = macWhitelist.get(normalizedMac);
+    entry.accessType = accessType;
+    entry.updatedAt = new Date().toISOString();
+    
+    await saveMACWhitelist();
+    
+    return res.status(200).json({
+        success: true,
+        message: 'Access type updated successfully',
+        data: entry
+    });
 }
 
-// List all MAC addresses (Admin only)
-async function handleListMACs(req, res, clientIP) {
-    if (req.method !== 'POST') {
-        return res.status(405).json({ success: false, message: 'Method not allowed' });
+// Remove MAC address from whitelist
+async function handleRemoveMAC(req, res) {
+    const { macAddress, adminKey } = req.body;
+    
+    if (!validateAdminKey(adminKey)) {
+        return res.status(403).json({
+            success: false,
+            message: 'Invalid admin key'
+        });
     }
     
+    if (!macAddress) {
+        return res.status(400).json({
+            success: false,
+            message: 'MAC address is required'
+        });
+    }
+    
+    const normalizedMac = macAddress.toLowerCase();
+    
+    if (!macWhitelist.has(normalizedMac)) {
+        return res.status(404).json({
+            success: false,
+            message: 'MAC address not found in whitelist'
+        });
+    }
+    
+    macWhitelist.delete(normalizedMac);
+    await saveMACWhitelist();
+    
+    return res.status(200).json({
+        success: true,
+        message: 'MAC address removed successfully'
+    });
+}
+
+// List all MAC addresses (admin only)
+async function handleListMACs(req, res) {
     const { adminKey } = req.body;
     
-    const requiredAdminKey = process.env.ADMIN_SECRET_KEY || 'default-admin-key-change-me';
-    if (!verifyAdminKey(adminKey, requiredAdminKey)) {
-        logSecurityEvent('UNAUTHORIZED_ADMIN', 'Invalid admin key for listing', clientIP);
-        return res.status(401).json({
+    if (!validateAdminKey(adminKey)) {
+        return res.status(403).json({
             success: false,
-            message: 'Unauthorized: Invalid admin credentials'
+            message: 'Invalid admin key'
         });
     }
     
-    try {
-        const result = await macDB.listMACAddresses();
-        
-        if (result.success) {
-            logSecurityEvent('MAC_LIST_ACCESSED', `Retrieved ${result.data.macAddresses.length} entries`, clientIP);
+    updateStatistics();
+    
+    return res.status(200).json({
+        success: true,
+        message: 'MAC addresses retrieved successfully',
+        data: {
+            macAddresses: Array.from(macWhitelist.values()).sort((a, b) => 
+                new Date(b.addedAt) - new Date(a.addedAt)
+            ),
+            statistics: statistics
         }
-        
-        return res.status(200).json(result);
-    } catch (error) {
-        logSecurityEvent('DATABASE_ERROR', error.message, clientIP);
-        return res.status(500).json({
-            success: false,
-            message: 'Database error occurred'
-        });
-    }
+    });
 }
 
-// Bulk add MAC addresses (Admin only)
-async function handleBulkAdd(req, res, clientIP) {
-    if (req.method !== 'POST') {
-        return res.status(405).json({ success: false, message: 'Method not allowed' });
-    }
-    
+// Bulk add MAC addresses
+async function handleBulkAdd(req, res) {
     const { macAddresses, adminKey } = req.body;
     
-    const requiredAdminKey = process.env.ADMIN_SECRET_KEY || 'default-admin-key-change-me';
-    if (!verifyAdminKey(adminKey, requiredAdminKey)) {
-        logSecurityEvent('UNAUTHORIZED_ADMIN', 'Invalid admin key for bulk add', clientIP);
-        return res.status(401).json({
+    if (!validateAdminKey(adminKey)) {
+        return res.status(403).json({
             success: false,
-            message: 'Unauthorized: Invalid admin credentials'
+            message: 'Invalid admin key'
         });
     }
     
-    if (!macAddresses || !Array.isArray(macAddresses) || macAddresses.length === 0) {
+    if (!macAddresses || !Array.isArray(macAddresses)) {
         return res.status(400).json({
             success: false,
             message: 'MAC addresses array is required'
         });
     }
     
-    for (const entry of macAddresses) {
-        if (!entry.macAddress || !validateMACAddress(entry.macAddress)) {
-            return res.status(400).json({
-                success: false,
-                message: `Invalid MAC address: ${entry.macAddress}`
-            });
+    const results = [];
+    let addedCount = 0;
+    
+    for (const macData of macAddresses) {
+        const { macAddress, description, accessType } = macData;
+        const normalizedMac = macAddress ? macAddress.toLowerCase() : '';
+        const finalAccessType = ['trial', 'unlimited', 'admin'].includes(accessType) ? accessType : 'trial';
+        
+        if (!macAddress) {
+            results.push({ macAddress: macAddress || 'invalid', success: false, message: 'Invalid MAC address' });
+            continue;
         }
         
-        if (entry.accessType && !['trial', 'unlimited', 'admin'].includes(entry.accessType)) {
-            return res.status(400).json({
-                success: false,
-                message: `Invalid access type for ${entry.macAddress}: ${entry.accessType}`
-            });
+        if (macWhitelist.has(normalizedMac)) {
+            results.push({ macAddress: normalizedMac, success: false, message: 'Already exists' });
+            continue;
         }
+        
+        const entry = {
+            macAddress: normalizedMac,
+            description: description || 'Bulk added',
+            accessType: finalAccessType,
+            addedAt: new Date().toISOString(),
+            lastSeen: null,
+            accessCount: 0,
+            lastDevice: null
+        };
+        
+        macWhitelist.set(normalizedMac, entry);
+        results.push({ macAddress: normalizedMac, success: true, message: 'Added successfully' });
+        addedCount++;
     }
     
-    try {
-        const result = await macDB.bulkAddMACs(macAddresses);
-        
-        if (result.success) {
-            logSecurityEvent('BULK_ADD', `Added ${result.data.summary.added} MACs`, clientIP);
-        }
-        
-        return res.status(result.success ? 200 : 400).json(result);
-    } catch (error) {
-        logSecurityEvent('DATABASE_ERROR', error.message, clientIP);
-        return res.status(500).json({
-            success: false,
-            message: 'Database error occurred'
-        });
+    if (addedCount > 0) {
+        await saveMACWhitelist();
     }
+    
+    return res.status(200).json({
+        success: true,
+        message: `Bulk add completed. ${addedCount} MAC addresses added.`,
+        data: {
+            results: results,
+            totalProcessed: macAddresses.length,
+            totalAdded: addedCount
+        }
+    });
 }

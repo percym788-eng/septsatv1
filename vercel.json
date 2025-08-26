@@ -10,13 +10,5 @@
       "src": "/api/mac-auth",
       "dest": "/api/mac-auth.js"
     }
-  ],
-  "env": {
-    "ADMIN_SECRET_KEY": "@admin_secret_key"
-  },
-  "build": {
-    "env": {
-      "NODE_OPTIONS": "--max-old-space-size=1024"
-    }
-  }
+  ]
 }

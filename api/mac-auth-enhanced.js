@@ -122,4 +122,405 @@ async function saveToStorage() {
     STRATEGIES.MEMORY_BACKUP = data;
     
     const successCount = results.filter(r => r.success).length;
-    console.log(`💾
+    console.log(`Saved to ${successCount}/${targets.length} storage locations`);
+    
+    return successCount > 0; // Return true if at least one save succeeded
+}
+
+// Update statistics based on current data
+function updateStatistics() {
+    const now = Date.now();
+    const oneDayAgo = now - (24 * 60 * 60 * 1000);
+    const oneWeekAgo = now - (7 * 24 * 60 * 60 * 1000);
+    
+    memoryStore.statistics.total = memoryStore.macAddresses.size;
+    memoryStore.statistics.activeLast24h = 0;
+    memoryStore.statistics.activeLast7d = 0;
+    memoryStore.statistics.neverUsed = 0;
+    memoryStore.statistics.totalAccesses = 0;
+    
+    for (const entry of memoryStore.macAddresses.values()) {
+        const lastSeen = entry.lastSeen ? new Date(entry.lastSeen).getTime() : 0;
+        memoryStore.statistics.totalAccesses += entry.accessCount || 0;
+        
+        if (lastSeen === 0) {
+            memoryStore.statistics.neverUsed++;
+        } else {
+            if (lastSeen > oneDayAgo) {
+                memoryStore.statistics.activeLast24h++;
+            }
+            if (lastSeen > oneWeekAgo) {
+                memoryStore.statistics.activeLast7d++;
+            }
+        }
+    }
+}
+
+// Validate admin key
+function validateAdminKey(providedKey) {
+    const ADMIN_SECRET_KEY = process.env.ADMIN_SECRET_KEY || "default-admin-key-change-this";
+    return providedKey === ADMIN_SECRET_KEY;
+}
+
+// Main API handler
+export default async function handler(req, res) {
+    // Initialize storage system
+    await initializeStorage();
+    
+    // Handle CORS
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    
+    if (req.method === 'OPTIONS') {
+        return res.status(200).end();
+    }
+    
+    const { action } = req.query;
+    
+    try {
+        switch (action) {
+            case 'check-access':
+                return await handleCheckAccess(req, res);
+            case 'add-mac':
+                return await handleAddMAC(req, res);
+            case 'update-access':
+                return await handleUpdateAccess(req, res);
+            case 'remove-mac':
+                return await handleRemoveMAC(req, res);
+            case 'list-macs':
+                return await handleListMACs(req, res);
+            case 'bulk-add':
+                return await handleBulkAdd(req, res);
+            case 'health':
+                return await handleHealthCheck(req, res);
+            default:
+                return res.status(400).json({
+                    success: false,
+                    message: 'Invalid action'
+                });
+        }
+    } catch (error) {
+        console.error('API Error:', error);
+        return res.status(500).json({
+            success: false,
+            message: 'Internal server error',
+            error: error.message
+        });
+    }
+}
+
+// Health check endpoint
+async function handleHealthCheck(req, res) {
+    return res.status(200).json({
+        success: true,
+        message: 'API is healthy',
+        data: {
+            initialized: memoryStore.initialized,
+            totalMACs: memoryStore.macAddresses.size,
+            lastLoaded: memoryStore.lastLoaded,
+            timestamp: new Date().toISOString()
+        }
+    });
+}
+
+// Check if MAC address has access
+async function handleCheckAccess(req, res) {
+    const { macAddresses, deviceInfo } = req.body;
+    
+    if (!macAddresses || !Array.isArray(macAddresses) || macAddresses.length === 0) {
+        return res.status(400).json({
+            success: false,
+            message: 'MAC addresses are required'
+        });
+    }
+    
+    // Check if any of the provided MAC addresses are whitelisted
+    let authorizedEntry = null;
+    for (const macAddress of macAddresses) {
+        const normalizedMac = macAddress.toLowerCase();
+        if (memoryStore.macAddresses.has(normalizedMac)) {
+            authorizedEntry = memoryStore.macAddresses.get(normalizedMac);
+            break;
+        }
+    }
+    
+    if (!authorizedEntry) {
+        return res.status(403).json({
+            success: false,
+            message: 'Device not authorized. MAC address not in whitelist.',
+            data: null
+        });
+    }
+    
+    // Update last seen and access count
+    authorizedEntry.lastSeen = new Date().toISOString();
+    authorizedEntry.accessCount = (authorizedEntry.accessCount || 0) + 1;
+    
+    // Update device info if provided
+    if (deviceInfo) {
+        authorizedEntry.lastDevice = {
+            hostname: deviceInfo.hostname,
+            username: deviceInfo.username,
+            platform: deviceInfo.platform,
+            localIP: deviceInfo.localIP,
+            publicIP: deviceInfo.publicIP
+        };
+    }
+    
+    // Save updated data (async, don't wait)
+    saveToStorage().catch(error => {
+        console.error('Failed to save after access check:', error);
+    });
+    
+    return res.status(200).json({
+        success: true,
+        message: 'Device authorized',
+        data: {
+            macAddress: authorizedEntry.macAddress,
+            description: authorizedEntry.description,
+            accessType: authorizedEntry.accessType || 'trial',
+            addedAt: authorizedEntry.addedAt,
+            lastSeen: authorizedEntry.lastSeen,
+            accessCount: authorizedEntry.accessCount
+        }
+    });
+}
+
+// Add MAC address to whitelist
+async function handleAddMAC(req, res) {
+    const { macAddress, description, accessType, adminKey } = req.body;
+    
+    if (!validateAdminKey(adminKey)) {
+        return res.status(403).json({
+            success: false,
+            message: 'Invalid admin key'
+        });
+    }
+    
+    if (!macAddress) {
+        return res.status(400).json({
+            success: false,
+            message: 'MAC address is required'
+        });
+    }
+    
+    const normalizedMac = macAddress.toLowerCase();
+    const validAccessTypes = ['trial', 'unlimited', 'admin'];
+    const finalAccessType = validAccessTypes.includes(accessType) ? accessType : 'trial';
+    
+    if (memoryStore.macAddresses.has(normalizedMac)) {
+        return res.status(409).json({
+            success: false,
+            message: 'MAC address already exists in whitelist'
+        });
+    }
+    
+    const entry = {
+        macAddress: normalizedMac,
+        description: description || 'No description',
+        accessType: finalAccessType,
+        addedAt: new Date().toISOString(),
+        lastSeen: null,
+        accessCount: 0,
+        lastDevice: null
+    };
+    
+    memoryStore.macAddresses.set(normalizedMac, entry);
+    
+    // Save to storage
+    const saved = await saveToStorage();
+    if (!saved) {
+        console.error('WARNING: MAC address added to memory but failed to persist to storage');
+    }
+    
+    return res.status(201).json({
+        success: true,
+        message: 'MAC address added successfully',
+        data: entry,
+        persistent: saved
+    });
+}
+
+// Update access type for existing MAC
+async function handleUpdateAccess(req, res) {
+    const { macAddress, accessType, adminKey } = req.body;
+    
+    if (!validateAdminKey(adminKey)) {
+        return res.status(403).json({
+            success: false,
+            message: 'Invalid admin key'
+        });
+    }
+    
+    if (!macAddress || !accessType) {
+        return res.status(400).json({
+            success: false,
+            message: 'MAC address and access type are required'
+        });
+    }
+    
+    const normalizedMac = macAddress.toLowerCase();
+    const validAccessTypes = ['trial', 'unlimited', 'admin'];
+    
+    if (!validAccessTypes.includes(accessType)) {
+        return res.status(400).json({
+            success: false,
+            message: 'Invalid access type. Must be: trial, unlimited, or admin'
+        });
+    }
+    
+    if (!memoryStore.macAddresses.has(normalizedMac)) {
+        return res.status(404).json({
+            success: false,
+            message: 'MAC address not found in whitelist'
+        });
+    }
+    
+    const entry = memoryStore.macAddresses.get(normalizedMac);
+    entry.accessType = accessType;
+    entry.updatedAt = new Date().toISOString();
+    
+    // Save to storage
+    const saved = await saveToStorage();
+    
+    return res.status(200).json({
+        success: true,
+        message: 'Access type updated successfully',
+        data: entry,
+        persistent: saved
+    });
+}
+
+// Remove MAC address from whitelist
+async function handleRemoveMAC(req, res) {
+    const { macAddress, adminKey } = req.body;
+    
+    if (!validateAdminKey(adminKey)) {
+        return res.status(403).json({
+            success: false,
+            message: 'Invalid admin key'
+        });
+    }
+    
+    if (!macAddress) {
+        return res.status(400).json({
+            success: false,
+            message: 'MAC address is required'
+        });
+    }
+    
+    const normalizedMac = macAddress.toLowerCase();
+    
+    if (!memoryStore.macAddresses.has(normalizedMac)) {
+        return res.status(404).json({
+            success: false,
+            message: 'MAC address not found in whitelist'
+        });
+    }
+    
+    memoryStore.macAddresses.delete(normalizedMac);
+    
+    // Save to storage
+    const saved = await saveToStorage();
+    
+    return res.status(200).json({
+        success: true,
+        message: 'MAC address removed successfully',
+        persistent: saved
+    });
+}
+
+// List all MAC addresses (admin only)
+async function handleListMACs(req, res) {
+    const { adminKey } = req.body;
+    
+    if (!validateAdminKey(adminKey)) {
+        return res.status(403).json({
+            success: false,
+            message: 'Invalid admin key'
+        });
+    }
+    
+    updateStatistics();
+    
+    return res.status(200).json({
+        success: true,
+        message: 'MAC addresses retrieved successfully',
+        data: {
+            macAddresses: Array.from(memoryStore.macAddresses.values()).sort((a, b) => 
+                new Date(b.addedAt) - new Date(a.addedAt)
+            ),
+            statistics: memoryStore.statistics
+        }
+    });
+}
+
+// Bulk add MAC addresses
+async function handleBulkAdd(req, res) {
+    const { macAddresses, adminKey } = req.body;
+    
+    if (!validateAdminKey(adminKey)) {
+        return res.status(403).json({
+            success: false,
+            message: 'Invalid admin key'
+        });
+    }
+    
+    if (!macAddresses || !Array.isArray(macAddresses)) {
+        return res.status(400).json({
+            success: false,
+            message: 'MAC addresses array is required'
+        });
+    }
+    
+    const results = [];
+    let addedCount = 0;
+    
+    for (const macData of macAddresses) {
+        const { macAddress, description, accessType } = macData;
+        const normalizedMac = macAddress ? macAddress.toLowerCase() : '';
+        const finalAccessType = ['trial', 'unlimited', 'admin'].includes(accessType) ? accessType : 'trial';
+        
+        if (!macAddress) {
+            results.push({ macAddress: macAddress || 'invalid', success: false, message: 'Invalid MAC address' });
+            continue;
+        }
+        
+        if (memoryStore.macAddresses.has(normalizedMac)) {
+            results.push({ macAddress: normalizedMac, success: false, message: 'Already exists' });
+            continue;
+        }
+        
+        const entry = {
+            macAddress: normalizedMac,
+            description: description || 'Bulk added',
+            accessType: finalAccessType,
+            addedAt: new Date().toISOString(),
+            lastSeen: null,
+            accessCount: 0,
+            lastDevice: null
+        };
+        
+        memoryStore.macAddresses.set(normalizedMac, entry);
+        results.push({ macAddress: normalizedMac, success: true, message: 'Added successfully' });
+        addedCount++;
+    }
+    
+    // Save to storage if any were added
+    let saved = false;
+    if (addedCount > 0) {
+        saved = await saveToStorage();
+    }
+    
+    return res.status(200).json({
+        success: true,
+        message: `Bulk add completed. ${addedCount} MAC addresses added.`,
+        data: {
+            results: results,
+            totalProcessed: macAddresses.length,
+            totalAdded: addedCount
+        },
+        persistent: saved
+    });
+}

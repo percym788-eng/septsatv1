@@ -1,4 +1,22 @@
 {
   "version": 2,
-  "regions": ["iad1"]
+  "functions": {
+    "api/mac-auth.js": {
+      "runtime": "@vercel/node"
+    }
+  },
+  "routes": [
+    {
+      "src": "/api/mac-auth",
+      "dest": "/api/mac-auth.js"
+    }
+  ],
+  "env": {
+    "ADMIN_SECRET_KEY": "@admin_secret_key"
+  },
+  "build": {
+    "env": {
+      "NODE_OPTIONS": "--max-old-space-size=1024"
+    }
+  }
 }

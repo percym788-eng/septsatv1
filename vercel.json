@@ -1,14 +1,8 @@
 {
   "version": 2,
   "functions": {
-    "api/mac-auth.js": {
-      "runtime": "@vercel/node"
+    "api/*.js": {
+      "runtime": "@vercel/node@3.0.7"
     }
-  },
-  "routes": [
-    {
-      "src": "/api/mac-auth",
-      "dest": "/api/mac-auth.js"
-    }
-  ]
+  }
 }
